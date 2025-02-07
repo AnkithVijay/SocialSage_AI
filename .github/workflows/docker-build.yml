@@ -32,7 +32,7 @@ jobs:
           context: .
           push: true
           tags: |
-            socialfi-agent:latest
-            socialfi-agent:${{ github.run_number }}
-          cache-from: type=registry,ref=socialfi-agent:buildcache
-          cache-to: type=registry,ref=socialfi-agent:buildcache,mode=max 
+            ${{ env.DOCKER_HUB_REPO }}:latest
+            ${{ env.DOCKER_HUB_REPO }}:${{ github.run_number }}
+          cache-from: type=registry,ref=${{ env.DOCKER_HUB_REPO }}:buildcache
+          cache-to: type=registry,ref=${{ env.DOCKER_HUB_REPO }}:buildcache,mode=max 
