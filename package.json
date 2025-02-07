@@ -1,0 +1,39 @@
+{
+  "name": "autonomous-agent-system",
+  "version": "1.0.0",
+  "description": "Self-replicating autonomous agents for DeFi opportunities",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "nodemon --watch 'src/**/*.ts' --exec 'ts-node' src/index.ts",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.2.0",
+    "@safe-global/protocol-kit": "^2.0.0",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@uniswap/v2-periphery": "1.1.0-beta.0",
+    "@uniswap/v3-periphery": "^1.4.4",
+    "agent-twitter-client": "^0.0.18",
+    "axios": "^1.6.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.1",
+    "ethers": "^6.11.1",
+    "express": "^4.21.2",
+    "openai": "^4.83.0",
+    "twitter-api-v2": "^1.15.2",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.17",
+    "@types/winston": "^2.4.4",
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.3",
+    "ts-jest": "^29.1.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}
