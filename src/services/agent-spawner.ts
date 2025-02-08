@@ -6,6 +6,7 @@ import { VeniceAI } from './venice-ai';
 import { AgentFactory } from '../factory/autonome-factory';
 import { Judge } from '../ai/judge';
 import { UniswapService } from './uniswap-service';
+import { HealthMonitor, HealthConfig } from '../health/killswitch';
 
 // Token addresses on Base
 const TOKEN_ADDRESSES: { [key: string]: string } = {
@@ -14,6 +15,9 @@ const TOKEN_ADDRESSES: { [key: string]: string } = {
   'BASE': '0xfA980cEd6895AC314E7dE34Ef1bFAE90a5AdD21b',
   'AERO': '0x940181a94A35A4569E4529A3CDfB74e38FD98631',
 };
+
+// Uniswap V3 Router address on Base
+const UNISWAP_V3_ROUTER = '0x2626664c2603336E57B271c5C0b26F421741e481';
 
 interface SpawnConfig {
   minSentiment: number;
@@ -41,6 +45,8 @@ interface Position {
   currentPrice: string;
   pnl: string;
   strategy: string;
+  lastUpdate: number;
+  tokenAddress: string;
 }
 
 interface AgentStatus {
@@ -78,6 +84,8 @@ export class AgentSpawner {
   private wallet: ethers.HDNodeWallet;
   private provider: ethers.JsonRpcProvider;
   private monitoredTokens: string[];
+  private positions: Map<string, Position>;
+  private healthMonitor: HealthMonitor;
 
   constructor(
     rpcUrl: string,
@@ -98,10 +106,13 @@ export class AgentSpawner {
     this.startTime = Date.now();
     this.tradeHistory = [];
     this.provider = new ethers.JsonRpcProvider(rpcUrl);
+    console.log("MNEMONIC",process.env.MNEMONIC?.toString());
     this.wallet = ethers.Wallet.fromPhrase(process.env.MNEMONIC || '') as ethers.HDNodeWallet;
     this.uniswap = new UniswapService(rpcUrl, this.wallet.privateKey);
     this.activeAgents = new Map();
     this.monitoredTokens = ['ETH', 'BTC', 'BASE', 'USDC', 'AERO'];
+    this.positions = new Map();
+    this.healthMonitor = new HealthMonitor(rpcUrl);
   }
 
   async init() {
@@ -166,15 +177,23 @@ export class AgentSpawner {
         );
 
         if (tx) {
-          await this._recordTrade({
+          const trade = {
             timestamp: Date.now(),
             token,
-            type: 'buy',
+            type: 'buy' as const,
             amount,
-            price: '0.0', // Implement price tracking
+            price: '0.0', // Will be updated by position tracking
             txHash: tx.hash,
-            status: 'completed'
-          });
+            status: 'completed' as const
+          };
+
+          await this._recordTrade(trade);
+
+          // Update health monitor
+          const agentIds = this.activeAgents.get(token) || new Set();
+          for (const agentId of agentIds) {
+            await this.healthMonitor.recordTrade(agentId, true, amount);
+          }
         }
 
         return tx;
@@ -366,28 +385,102 @@ export class AgentSpawner {
     };
   }
 
+  private async getTokenPrice(tokenAddress: string): Promise<string> {
+    try {
+      // Get WETH price for the token using Uniswap V3 pool
+      const poolContract = new ethers.Contract(
+        UNISWAP_V3_ROUTER,
+        ['function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)'],
+        this.provider
+      );
+
+      const slot0 = await poolContract.slot0();
+      const sqrtPriceX96 = slot0.sqrtPriceX96;
+      
+      // Convert sqrtPriceX96 to actual price
+      const price = (Number(sqrtPriceX96) ** 2 * 2 ** 192) / (2 ** 96) ** 2;
+      return price.toString();
+    } catch (error) {
+      this.logger.error('Error getting token price', { error, tokenAddress });
+      return '0';
+    }
+  }
+
+  private async updatePosition(token: string, trade: Trade) {
+    const tokenAddress = TOKEN_ADDRESSES[token];
+    if (!tokenAddress) return;
+
+    const currentPosition = this.positions.get(token) || {
+      token,
+      amount: '0',
+      entryPrice: '0',
+      currentPrice: '0',
+      pnl: '0',
+      strategy: 'sentiment-based',
+      lastUpdate: Date.now(),
+      tokenAddress
+    };
+
+    const currentPrice = await this.getTokenPrice(tokenAddress);
+    const tradeAmount = ethers.parseEther(trade.amount);
+    const currentAmount = ethers.parseEther(currentPosition.amount);
+
+    if (trade.type === 'buy') {
+      const newAmount = currentAmount + tradeAmount;
+      const newEntryPrice = (
+        (currentAmount * BigInt(currentPosition.entryPrice) + 
+        tradeAmount * BigInt(trade.price)) / newAmount
+      ).toString();
+
+      currentPosition.amount = ethers.formatEther(newAmount);
+      currentPosition.entryPrice = newEntryPrice;
+    } else {
+      const newAmount = currentAmount - tradeAmount;
+      currentPosition.amount = ethers.formatEther(newAmount);
+    }
+
+    currentPosition.currentPrice = currentPrice;
+    currentPosition.lastUpdate = Date.now();
+
+    // Calculate PnL
+    const pnl = (
+      (Number(currentPrice) - Number(currentPosition.entryPrice)) * 
+      Number(currentPosition.amount)
+    ).toString();
+    currentPosition.pnl = pnl;
+
+    this.positions.set(token, currentPosition);
+    this.logger.info('Position updated', { token, position: currentPosition });
+  }
+
+  private async _recordTrade(trade: Trade) {
+    this.tradeHistory.push(trade);
+    await this.updatePosition(trade.token, trade);
+    
+    // Keep only last 100 trades
+    if (this.tradeHistory.length > 100) {
+      this.tradeHistory = this.tradeHistory.slice(-100);
+    }
+  }
+
   async getActivePositions(): Promise<Position[]> {
     const positions: Position[] = [];
     
-    for (const [token, agents] of this.activeAgents.entries()) {
-      if (agents.size > 0) {
-        // Get token price from Uniswap
-        const tokenAddress = TOKEN_ADDRESSES[token];
-        if (!tokenAddress) continue;
+    for (const [token, position] of this.positions.entries()) {
+      try {
+        // Update current price
+        const currentPrice = await this.getTokenPrice(position.tokenAddress);
+        position.currentPrice = currentPrice;
 
-        try {
-          const position: Position = {
-            token,
-            amount: '0.0', // Implement actual position tracking
-            entryPrice: '0.0',
-            currentPrice: '0.0',
-            pnl: '0.0',
-            strategy: 'sentiment-based'
-          };
-          positions.push(position);
-        } catch (error) {
-          this.logger.error('Error getting position', { error, token });
-        }
+        // Update PnL
+        position.pnl = (
+          (Number(currentPrice) - Number(position.entryPrice)) * 
+          Number(position.amount)
+        ).toString();
+
+        positions.push(position);
+      } catch (error) {
+        this.logger.error('Error updating position', { error, token });
       }
     }
 
@@ -440,15 +533,6 @@ export class AgentSpawner {
     }
 
     return balances;
-  }
-
-  // Add this method to track trades
-  private async _recordTrade(trade: Trade) {
-    this.tradeHistory.push(trade);
-    // Keep only last 100 trades
-    if (this.tradeHistory.length > 100) {
-      this.tradeHistory = this.tradeHistory.slice(-100);
-    }
   }
 
   getWalletPrivateKey(): string {
@@ -507,6 +591,32 @@ export class AgentSpawner {
         this.activeAgents.set(token, new Set());
       }
       this.activeAgents.get(token)?.add(agentId);
+
+      // Start health monitoring
+      const healthConfig: HealthConfig = {
+        maxLoss: Number(process.env.MAX_LOSS_PERCENTAGE) || 20,
+        maxInactivity: Number(process.env.MAX_INACTIVITY_HOURS) || 2,
+        minROI: Number(process.env.MIN_ROI_PERCENTAGE) || 15,
+        checkInterval: 60000 // 1 minute
+      };
+
+      // Create mock agent for monitoring
+      const mockAgent = {
+        id: agentId,
+        address: this.wallet.address,
+        config: {
+          template: 'sentiment-based',
+          config: {
+            capital: this.calculatePositionSize(analysis.confidence),
+            targetPool: TOKEN_ADDRESSES[token],
+            maxSlippage: 0.005
+          },
+          funding: 'treasury' as const
+        },
+        deployedAt: Date.now()
+      };
+
+      await this.healthMonitor.monitorAgent(mockAgent, healthConfig);
 
       this.logger.info('Agent spawned', {
         agentId,
